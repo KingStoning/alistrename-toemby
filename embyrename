@@ -1,0 +1,464 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="$DIR/renamer.py"
+VENV="$DIR/.venv"
+# 可选：把配置/日志目录放到独立位置（只需在系统环境里设置一次）
+#   export EMBYRENAME_CONFIG_DIR=/opt/embyrename
+# 之后运行命令不需要再写 `env XXX=...` 前缀。
+CONFIG_DIR="${EMBYRENAME_CONFIG_DIR:-${EMBYRENAME_HOME:-$DIR}}"
+ENVFILE="$CONFIG_DIR/.env"
+LOGDIR="$CONFIG_DIR/logs"
+PIDFILE="$CONFIG_DIR/daemon.pid"
+
+usage() {
+  cat <<USAGE
+用法：
+  ./embyrename setup                         # ✅ 一次性向导：生成 .env + 自动发现 TV_ROOTS（推荐）
+  ./embyrename search "关键词"               # 只用 AList 搜索，不改动任何东西（低风控）
+  ./embyrename fix   "关键词"                # ✅ 只修复一个剧：plan → 确认 → apply
+  ./embyrename plan  [--only "关键词"] [--ui]        # 预演，不改动
+  ./embyrename apply [--only "关键词"] [--yes] [--ui]# 真执行（默认二次确认）
+  ./embyrename go    [--only "关键词"] [--ui]        # 一键：plan → 确认 → apply
+
+  ./embyrename batch [--ui]                  # ✅ 批量：对 TV_ROOTS 下所有剧(仅一层)执行 go（低风控）
+  ./embyrename daemon [--ui]                 # ✅ 后台跑批量：nohup 方式（适合你关电脑）
+  ./embyrename status                        # 查看后台任务状态
+  ./embyrename stop                          # 停止后台任务
+  ./embyrename undo  <undo.jsonl> [--yes]    # 回滚上一次 apply 产生的 rename/move
+
+说明：
+  - AI 自动开关：.env 里填了 AI_API_KEY 就会启用；不填则完全不调用 AI。
+  - 防风控：.env 里 ALIST_SLEEP_READ/WRITE、TMDB_SLEEP、AI_SLEEP 控制请求间隔。
+  - 跳过广告/福利/无关目录：.env 里 SKIP_DIR_REGEX。
+  - 批量不会卷电影：只处理 TV_ROOTS 指向的「电视剧/动漫」目录。
+  - 日志：默认写入 "${EMBYRENAME_CONFIG_DIR:-${EMBYRENAME_HOME:-<bundle>}}/logs"；加 --ui 开启实时日志网页（LOG_HOST/LOG_PORT/LOGUI_TOKEN 控制）。
+USAGE
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "缺少命令：$1" >&2
+    exit 1
+  }
+}
+
+ensure_venv() {
+  need_cmd python3
+  if [[ ! -d "$VENV" ]]; then
+    echo "[+] 创建虚拟环境 $VENV"
+    python3 -m venv "$VENV" || true
+    if [[ ! -f "$VENV/bin/activate" ]]; then
+      echo "[ERROR] 虚拟环境创建失败：$VENV/bin/activate 不存在" >&2
+      echo "解决：先安装依赖，再重试：" >&2
+      echo "  sudo apt-get update && sudo apt-get install -y python3-venv python3-pip" >&2
+      exit 3
+    fi
+  fi
+  # shellcheck disable=SC1091
+  source "$VENV/bin/activate"
+  python -c "import requests" >/dev/null 2>&1 || {
+    echo "[+] 安装依赖（requests）"
+    pip install -q -r "$DIR/requirements.txt"
+  }
+}
+
+load_env() {
+  if [[ ! -f "$ENVFILE" ]]; then
+    echo "未找到配置：$ENVFILE" >&2
+    echo "你可以运行：./embyrename setup 一次性生成并自动发现 TV_ROOTS。" >&2
+    echo "如果你把配置放在别的地方，请在系统环境里设置 EMBYRENAME_CONFIG_DIR。" >&2
+    exit 2
+  fi
+  # 兼容 Windows 记事本保存的 CRLF（否则 source 会报 $'\r'）
+  sed -i 's/\r$//' "$ENVFILE" 2>/dev/null || true
+
+  # 如果用户在命令行临时传了环境变量，则不要被 .env 覆盖。
+  local _pre_ALIST_URL="${ALIST_URL-}"
+  local _pre_ALIST_TOKEN="${ALIST_TOKEN-}"
+  local _pre_TMDB_KEY="${TMDB_KEY-}"
+  local _pre_TMDB_LANG="${TMDB_LANG-}"
+  local _pre_TMDB_API_BASE="${TMDB_API_BASE-}"
+  local _pre_TV_ROOTS="${TV_ROOTS-}"
+  local _pre_AUTO_DISCOVER_ROOTS="${AUTO_DISCOVER_ROOTS-}"
+
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENVFILE"
+  set +a
+
+  [[ -n "$_pre_ALIST_URL" ]] && export ALIST_URL="$_pre_ALIST_URL"
+  [[ -n "$_pre_ALIST_TOKEN" ]] && export ALIST_TOKEN="$_pre_ALIST_TOKEN"
+  [[ -n "$_pre_TMDB_KEY" ]] && export TMDB_KEY="$_pre_TMDB_KEY"
+  [[ -n "$_pre_TMDB_LANG" ]] && export TMDB_LANG="$_pre_TMDB_LANG"
+  [[ -n "$_pre_TMDB_API_BASE" ]] && export TMDB_API_BASE="$_pre_TMDB_API_BASE"
+  [[ -n "$_pre_TV_ROOTS" ]] && export TV_ROOTS="$_pre_TV_ROOTS"
+  [[ -n "$_pre_AUTO_DISCOVER_ROOTS" ]] && export AUTO_DISCOVER_ROOTS="$_pre_AUTO_DISCOVER_ROOTS"
+
+  : "${ALIST_URL:?请在 .env 里填写 ALIST_URL}"
+  : "${ALIST_TOKEN:?请在 .env 里填写 ALIST_TOKEN}"
+}
+
+load_env_soft() {
+  # 仅用于 stop/status：尽量加载 LOG_PORT/LOGUI_TOKEN 等，不强制校验必填项
+  [[ -f "$ENVFILE" ]] || return 0
+  sed -i 's/\r$//' "$ENVFILE" 2>/dev/null || true
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENVFILE" >/dev/null 2>&1 || true
+  set +a
+}
+
+
+cmd_setup() {
+  mkdir -p "$CONFIG_DIR"
+  if [[ -f "$ENVFILE" ]]; then
+    echo "$ENVFILE 已存在，拒绝覆盖。你要重置就手动删除再 setup。" >&2
+    exit 1
+  fi
+  cp "$DIR/.env.example" "$ENVFILE"
+  echo "[SETUP] 请输入你的配置（直接回车使用默认值）："
+  read -r -p "AList URL (如 http://127.0.0.1:5244): " alist_url
+  read -r -p "AList Token: " alist_token
+  read -r -p "TMDB Key: " tmdb_key
+  read -r -p "AI API Key (可选，回车跳过): " ai_key
+
+  [[ -n "$alist_url" ]] && perl -pi -e "s|^ALIST_URL=\".*\"|ALIST_URL=\"$alist_url\"|" "$ENVFILE"
+  [[ -n "$alist_token" ]] && perl -pi -e "s|^ALIST_TOKEN=\".*\"|ALIST_TOKEN=\"$alist_token\"|" "$ENVFILE"
+  [[ -n "$tmdb_key" ]] && perl -pi -e "s|^TMDB_KEY=\".*\"|TMDB_KEY=\"$tmdb_key\"|" "$ENVFILE"
+  [[ -n "$ai_key" ]] && perl -pi -e "s|^AI_API_KEY=\".*\"|AI_API_KEY=\"$ai_key\"|" "$ENVFILE"
+
+  ensure_venv
+  set -a; source "$ENVFILE"; set +a
+
+  echo "[SETUP] 自动发现 TV_ROOTS（只找 电视剧/动漫，不会卷电影）..."
+  found=$(python "$PY" --alist-url "$ALIST_URL" --alist-token "$ALIST_TOKEN" --discover-only 2>/dev/null || true)
+  if [[ -n "$found" ]]; then
+    perl -pi -e "s|^TV_ROOTS=\".*\"|TV_ROOTS=\"$found\"|" "$ENVFILE"
+    perl -pi -e "s|^AUTO_DISCOVER_ROOTS=\".*\"|AUTO_DISCOVER_ROOTS=\"0\"|" "$ENVFILE"
+    echo "[OK] 已写入 TV_ROOTS：$found"
+  else
+    echo "[WARN] 未能自动发现 TV_ROOTS。你仍可在 .env 里手填 TV_ROOTS，或保持 AUTO_DISCOVER_ROOTS=1。"
+  fi
+
+  echo
+  echo "完成。下一步建议："
+  echo "  ./embyrename search \"他为什么依然单身\""
+  echo "  ./embyrename fix   \"他为什么依然单身\" --ui"
+}
+
+cmd_search() {
+  ensure_venv
+  load_env
+  local keyword="${1-}"
+  [[ -z "$keyword" ]] && { usage; exit 1; }
+  python "$PY" --alist-url "$ALIST_URL" --alist-token "$ALIST_TOKEN" --roots "${TV_ROOTS:-}" --search-only "$keyword" \
+    --skip-dir-regex "${SKIP_DIR_REGEX:-}" \
+    --sleep "${ALIST_SLEEP_READ:-${ALIST_SLEEP:-0.8}}"
+}
+
+run_mode() {
+  local mode="$1"; shift || true
+  ensure_venv
+  load_env
+
+  # 真正改名时必须有 TMDB_KEY
+  : "${TMDB_KEY:?请在 .env 里填写 TMDB_KEY}"
+
+  local yes=0
+  local ui=0
+  if [[ "${LOG_WEB:-}" =~ ^(1|true|yes|y)$ ]]; then ui=1; fi
+
+  local keyword=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      --ui) ui=1; shift ;;
+      --no-ui) ui=0; shift ;;
+      --only) keyword="${2-}"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+
+  local dry="--dry-run"
+  [[ "$mode" == "apply" ]] && dry=""
+
+  local web=""
+  [[ $ui -eq 1 ]] && web="--log-web"
+
+  python "$PY" \
+    --alist-url "$ALIST_URL" \
+    --alist-token "$ALIST_TOKEN" \
+    --tmdb-key "$TMDB_KEY" \
+    --tmdb-lang "${TMDB_LANG:-zh-CN}" \
+    --roots "${TV_ROOTS:-}" \
+    --season-format "${SEASON_FORMAT:-S{season:02d}}" \
+    --skip-dir-regex "${SKIP_DIR_REGEX:-}" \
+    --sleep "${ALIST_SLEEP_READ:-${ALIST_SLEEP:-0.8}}" \
+    --tmdb-sleep "${TMDB_SLEEP:-0.3}" \
+    --ai-base-url "${AI_BASE_URL:-}" \
+    --ai-api-key "${AI_API_KEY:-}" \
+    --ai-model "${AI_MODEL:-}" \
+    --ai-sleep "${AI_SLEEP:-1.2}" \
+    $web \
+    $dry \
+    ${keyword:+--keyword "$keyword"}
+}
+
+cmd_fix() {
+  local keyword="${1-}"
+  [[ -z "$keyword" ]] && { usage; exit 1; }
+  echo "[GO] 先预演(plan)，确认后执行(apply)"
+  run_mode plan --only "$keyword" "${@:2}" || true
+  echo
+  read -r -p "确认执行 apply？(y/N): " ans
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    run_mode apply --only "$keyword" "${@:2}" || true
+  else
+    echo "已取消。"
+  fi
+}
+
+cmd_plan() { run_mode plan "$@"; }
+cmd_apply() {
+  local keyword=""
+  local yes=0
+  local ui=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      --ui) ui=1; shift ;;
+      --only) keyword="${2-}"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  if [[ $yes -ne 1 ]]; then
+    echo "将执行真实改名/移动操作。"
+    read -r -p "确认继续？(y/N): " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { echo "已取消。"; exit 1; }
+  fi
+  run_mode apply ${keyword:+--only "$keyword"} ${ui:+--ui}
+}
+
+cmd_go() {
+  local keyword=""
+  local ui=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ui) ui=1; shift ;;
+      --only) keyword="${2-}"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  cmd_plan ${keyword:+--only "$keyword"} ${ui:+--ui} || true
+  echo
+  read -r -p "确认执行 apply？(y/N): " ans
+  [[ "$ans" =~ ^[Yy]$ ]] || { echo "已取消。"; exit 1; }
+  cmd_apply --yes ${keyword:+--only "$keyword"} ${ui:+--ui}
+}
+
+cmd_batch() {
+  # batch = go without keyword (only 1-level scan under TV_ROOTS)
+  cmd_go "$@"
+}
+
+cmd_daemon() {
+  # 后台跑批量：直接启动 Python（PID 就是 renamer.py，stop 能真正停掉）
+  ensure_venv
+  load_env
+  : "${TMDB_KEY:?请在 .env 里填写 TMDB_KEY}"
+
+  export LOG_WEB=1
+  : "${LOG_HOST:=0.0.0.0}"
+  : "${LOG_PORT:=53943}"
+
+  mkdir -p "$LOGDIR"
+  echo "[DAEMON] nohup 后台启动中..."
+  echo "[DAEMON] UI: http://<你的VPS公网IP>:${LOG_PORT}/?token=${LOGUI_TOKEN:-<empty>}"
+
+  # 关键点：nohup 直接跑 venv 里的 python，这样 pidfile 记录的就是 python 进程
+  nohup "$VENV/bin/python" "$PY" \
+    --alist-url "$ALIST_URL" \
+    --alist-token "$ALIST_TOKEN" \
+    --tmdb-key "$TMDB_KEY" \
+    --tmdb-lang "${TMDB_LANG:-zh-CN}" \
+    --roots "${TV_ROOTS}" \
+    --skip-dir-regex "${SKIP_DIR_REGEX:-}" \
+    --season-format "${SEASON_FORMAT:-S{season:02d}}" \
+    --sleep "${SLEEP:-1.6}" \
+    --tmdb-sleep "${TMDB_SLEEP:-0.3}" \
+    ${AI_BASE_URL:+--ai-base-url "$AI_BASE_URL"} \
+    ${AI_API_KEY:+--ai-api-key "$AI_API_KEY"} \
+    ${AI_MODEL:+--ai-model "$AI_MODEL"} \
+    ${AI_SLEEP:+--ai-sleep "$AI_SLEEP"} \
+    --log-web \
+    --yes \
+    > "$LOGDIR/nohup.out" 2>&1 &
+
+  local pid=$!
+  sleep 0.8
+  if ! ps -p "$pid" >/dev/null 2>&1; then
+    echo "[DAEMON] 启动失败：进程已退出。请查看日志：$LOGDIR/nohup.out"
+    echo "[DAEMON] nohup.out 尾部："
+    tail -n 80 "$LOGDIR/nohup.out" || true
+    rm -f "$PIDFILE" || true
+    exit 1
+  fi
+
+  echo "$pid" > "$PIDFILE"
+  echo "[DAEMON] PID: $pid  (pidfile: $PIDFILE)  日志: $LOGDIR/nohup.out"
+}
+
+
+cmd_undo() {
+  local file="${1-}"
+  shift || true
+  [[ -z "$file" ]] && { echo "需要 undo 文件路径" >&2; usage; exit 1; }
+  local yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      *) break ;;
+    esac
+  done
+  if [[ $yes -ne 1 ]]; then
+    echo "将执行回滚：$file"
+    read -r -p "确认继续？(y/N): " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { echo "已取消。"; exit 1; }
+  fi
+
+  ensure_venv
+  load_env
+  python "$PY" --alist-url "$ALIST_URL" --alist-token "$ALIST_TOKEN" --undo "$file" --yes
+}
+
+
+
+find_renamer_pids() {
+  # best-effort: find running renamer.py processes from this bundle
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -f "$PY" 2>/dev/null || true
+  else
+    ps -ef | grep -F "$PY" | grep -v grep | awk '{print $2}' || true
+  fi
+}
+
+target_stop_api() {
+  # best-effort: ask the web UI to stop gracefully (if running)
+  local port="${LOG_PORT:-53943}"
+  local token="${LOGUI_TOKEN:-}"
+  local url="http://127.0.0.1:${port}/api/stop"
+  if [[ -n "$token" ]]; then
+    url="${url}?token=${token}"
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 2 "$url" >/dev/null 2>&1 || true
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- --timeout=2 "$url" >/dev/null 2>&1 || true
+  fi
+}
+
+
+cmd_status() {
+  # 先看 pidfile
+  if [[ -f "$PIDFILE" ]]; then
+    local pid
+    pid=$(cat "$PIDFILE" 2>/dev/null || true)
+    if [[ -n "${pid:-}" ]] && ps -p "$pid" >/dev/null 2>&1; then
+      echo "[STATUS] running pid=$pid"
+      echo "[STATUS] log: $LOGDIR/nohup.out"
+      echo "[STATUS] ui : http://127.0.0.1:${LOG_PORT:-53943}/?token=${LOGUI_TOKEN:-}"
+      exit 0
+    fi
+    echo "[STATUS] pidfile exists but process not running (pid=$pid)"
+  else
+    echo "[STATUS] pidfile not found: $PIDFILE"
+  fi
+
+  # 再兜底：按 renamer.py 路径搜一把
+  local pids
+  pids=$(find_renamer_pids || true)
+  if [[ -n "${pids:-}" ]]; then
+    echo "[STATUS] found running renamer.py pid(s): ${pids}"
+    exit 0
+  fi
+  echo "[STATUS] not running"
+  exit 1
+}
+
+
+cmd_stop() {
+  # stop 优先走“温柔停机”（如果 UI 在的话），再 kill
+  # stop 不依赖你在什么目录下执行：只要用绝对路径调用这个脚本即可。
+
+  # 让 stop 能读到 LOG_PORT / LOGUI_TOKEN（尽量，不强制校验）
+  load_env_soft || true
+
+  # 先尝试通过 /api/stop 请求任务优雅退出
+  target_stop_api || true
+
+  local killed=0
+
+  # 1) pidfile
+  if [[ -f "$PIDFILE" ]]; then
+    local pid
+    pid=$(cat "$PIDFILE" 2>/dev/null || true)
+    if [[ -n "${pid:-}" ]] && ps -p "$pid" >/dev/null 2>&1; then
+      echo "[STOP] stopping pid=$pid ..."
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      if ps -p "$pid" >/dev/null 2>&1; then
+        echo "[STOP] still running, force kill -9 pid=$pid"
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+      killed=1
+    fi
+    rm -f "$PIDFILE" || true
+  fi
+
+  # 2) 兜底：按 renamer.py 路径找并 kill
+  local pids
+  pids=$(find_renamer_pids || true)
+  if [[ -n "${pids:-}" ]]; then
+    echo "[STOP] killing renamer.py pid(s): ${pids}"
+    # shellcheck disable=SC2086
+    kill ${pids} 2>/dev/null || true
+    sleep 1
+    # shellcheck disable=SC2086
+    kill -9 ${pids} 2>/dev/null || true
+    killed=1
+  fi
+
+  if [[ $killed -eq 1 ]]; then
+    echo "[STOP] done"
+    exit 0
+  fi
+
+  echo "[STOP] 没找到正在运行的任务。"
+  echo "你也可以手动查看：ps -ef | grep renamer.py | grep -v grep" >&2
+  exit 1
+}
+
+
+main() {
+  local cmd="${1-}"
+  shift || true
+  case "$cmd" in
+    setup) cmd_setup "$@" ;;
+    search) cmd_search "$@" ;;
+    fix) cmd_fix "$@" ;;
+    plan) cmd_plan "$@" ;;
+    apply) cmd_apply "$@" ;;
+    go) cmd_go "$@" ;;
+    batch) cmd_batch "$@" ;;
+    daemon) cmd_daemon "$@" ;;
+    status) cmd_status "$@" ;;
+    stop) cmd_stop "$@" ;;
+    undo) cmd_undo "$@" ;;
+    -h|--help|help|"") usage ;;
+    *) echo "未知命令: $cmd" >&2; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
