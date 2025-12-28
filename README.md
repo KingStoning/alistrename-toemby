@@ -1,8 +1,30 @@
-# embyrename (V2.12)
+开发起因:
+
+我用alist(oplist)挂载了OneDrive来弄Emby,需要批量重命名来符合Emby刮削,之前从夸克上传到OneDrive的文件内容都是杂乱无章的,没法正确识别
+
+为了解决我在找很多办法,找到了一些其它的项目,但是往往不如意,有个GitHub让我眼前一新,可以用python手动修改,但是在大量的文件夹面前,太耗费时间了(尽管识别率更高)
+
+所以我想到能不能自己用AI来写一个python,由此**alistrename-toemby**诞生了,中间改版了很多次,用了很长的时间,总有有了这个较为满意的版本
+
+我在 .env 里面加入了AI接口,可以当复杂的文件夹名字无法识别的时候,让AI选择最符合答案的剧名,然后搜索TMDB；当TMDB结果很多时,让AI自动选择最符合可能性的ID来刮削
+
+中间,我已经批量,运行了,保证正常运行,识别成功率在95%以上(默认不处理综艺和电影)
+
+# 额外提醒
+现在这个脚本只适用于 **电视剧/动漫/纪录片** 不适用于**电影/综艺**(因为综艺的文件名太难处理,识别率不高,建议是要识别综艺)
+
+使用之前,建议手动创建 `.env`,根据 `.env.example`里面的添加修改,需要加上自己的 **TMDB API KEY**和**AI api KEY** (这两个都是必须的,不然无法识别,AI上面需要第三方提供商的api 我建议使用 https://co.yes.vg/register?ref=wangdell)
+
+我在里面添加了tmdb api的中转地址,再次表示感谢
+
+最重要的是设置 `TV_ROOTS` 程序会默认执行这个目录,可以自己创建一个小目录,然后测试
+
+同时添加了WEB UI面板,默认是 `http://你的VPSIP:53943/?token=123456`
+# embyrename (V1.0.0)
 
 一个能直接跑在 **Ubuntu/VPS** 上的 AList 电视剧整理/重命名工具（面向 Emby/Jellyfin 刮削）。
 
-核心原则（按你的要求）：
+核心原则（）：
 
 - **文件名里只要已经有 `SxxEyy`：默认不改文件名**（但可能会移动到正确的 `S01/S02...` 目录）。
   - 例外：如果文件名包含明显广告/站点/引流标记（如 `www`、`http`、`公众号`、`关注` 等），会强制清理并改成标准命名。
@@ -15,7 +37,7 @@
 
 ---
 
-## 1) 一键开始（推荐）
+## 1) 一键开始
 
 > ✅ 如果你希望“配置/日志”放到独立目录（例如 /opt/embyrename），只需在系统环境里设置一次：
 >
@@ -86,16 +108,6 @@ chmod +x ./embyrename
 
 ## 5) 后台运行（你关电脑也不影响）
 
-推荐用 nohup（非交互，直接执行 apply）：
-
-```bash
-cd /AAAaaliyy/embyrename_bundle
-nohup ./embyrename apply --yes --ui > "${EMBYRENAME_CONFIG_DIR:-${EMBYRENAME_HOME:-.}}/logs/nohup.out" 2>&1 &
-tail -f "${EMBYRENAME_CONFIG_DIR:-${EMBYRENAME_HOME:-.}}/logs/nohup.out"
-```
-
-或者用脚本：
-
 ```bash
 ./embyrename daemon
 ```
@@ -116,7 +128,7 @@ tail -f "${EMBYRENAME_CONFIG_DIR:-${EMBYRENAME_HOME:-.}}/logs/nohup.out"
 
 ---
 
-## 7) 你关心的特殊情况支持
+## 7) 特殊情况支持
 
 - **“中文第4季26集” => Season 4**：已做映射（`第4季`、`第四季`、`Season 4`、`S4`、`S04` 等都会识别为 Season 4）。
 - **散落的 S04**：如果某些文件夹里混着 `S04/S4/第四季/第4季` 相关内容，会自动归并到 `S04` 文件夹。
