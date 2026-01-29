@@ -1,13 +1,3 @@
-## 毛遂自荐
-为了我和朋友的私服Emby,我开发了这个项目
-所以我想借此,宣传一下我们的私人Emby
-服务器是阿里云服务器BGP+世纪互联国内网盘 国内直连 无需挂梯 速度YYDS!
-网盘服 资源一点点上传(无秒传)到将近80TB
-热剧24小时内更新
-价格是 20RMB 三个月 90天
-喜欢的朋友可以联系我的qq哦
-![dfb7ab9c6e6b4151caa7afeb68b21c60](https://github.com/user-attachments/assets/dd24805a-14ea-41b1-818f-6d27f050bf92)
-
 ## 开发起因:
 
 我用alist(oplist)挂载了OneDrive来弄Emby,需要批量重命名来符合Emby刮削,之前从夸克上传到OneDrive的文件内容都是杂乱无章的,没法正确识别
@@ -192,3 +182,12 @@ failed get objs: failed get dir: object not found
 
 本项目只对“电视剧/动漫根目录”运行，请不要把电影根目录塞进去。
 
+## 毛遂自荐
+为了我和朋友的私服Emby,我开发了这个项目
+所以我想借此,宣传一下我们的私人Emby
+服务器是阿里云服务器BGP+世纪互联国内网盘 国内直连 无需挂梯 速度YYDS!
+网盘服 资源一点点上传(无秒传)到将近80TB
+热剧24小时内更新
+价格是 20RMB 三个月 90天
+喜欢的朋友可以联系我的qq哦
+![100*100](https://github.com/user-attachments/assets/dd24805a-14ea-41b1-818f-6d27f050bf92)
